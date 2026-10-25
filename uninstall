@@ -1,0 +1,101 @@
+#!/usr/bin/env python3
+"""Remove this installation while preserving later user changes."""
+import argparse
+import hashlib
+import json
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+
+STATE = Path(".local/state/omarchy-pixelbook")
+SERVICES = ["pixelbook-autorotate.service", "pixelbook-osk.service"]
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--home", type=Path, default=Path.home())
+    parser.add_argument("--no-start", action="store_true", help="Do not contact the live desktop")
+    args = parser.parse_args()
+    home = args.home.resolve()
+    if home != Path.home().resolve() and not args.no_start:
+        parser.error("An alternate --home requires --no-start")
+    path = home / STATE / "install.json"
+    if not path.exists():
+        print("No managed installation found; nothing changed.")
+        return
+    manifest = json.loads(path.read_text())
+    backup = home / manifest["backup"]
+    if not args.no_start:
+        subprocess.run(["systemctl", "--user", "stop", *SERVICES], check=True)
+    preserved = []
+    for name, record in manifest["files"].items():
+        target = home / name
+        if not target.exists() and not target.is_symlink():
+            continue
+        if target.is_symlink():
+            preserved.append(name)
+            continue
+        data = target.read_bytes()
+        if hashlib.sha256(data).hexdigest() == record["installed_sha256"]:
+            if record["existed"]:
+                shutil.copy2(backup / name, target)
+            else:
+                target.unlink()
+            continue
+        edit = record["edit"]
+        if not edit:
+            preserved.append(name)
+            continue
+        text = data.decode()
+        if edit["kind"] == "autostart":
+            text = text.replace(edit["block"], "", 1) if edit["block"] else text
+        elif edit["kind"] == "flags":
+            lines = text.splitlines(keepends=True)
+            for flag in edit["added"]:
+                for i, line in enumerate(lines):
+                    if line.rstrip("\r\n") == flag:
+                        del lines[i]
+                        break
+            text = "".join(lines)
+        elif edit["kind"] == "bar":
+            settings = json.loads(text)
+            changed = False
+            for items in settings["bar"]["layout"].values():
+                for i, widget in list(enumerate(items))[::-1]:
+                    if widget == edit["widget"]:
+                        if edit["old_widget"] is None:
+                            del items[i]
+                        else:
+                            items[i] = edit["old_widget"]
+                        changed = True
+                    elif widget.get("id") == "pixelbook.osk":
+                        preserved.append(name + " (edited keyboard widget)")
+            if not changed:
+                continue
+            text = json.dumps(settings, indent=2, ensure_ascii=False) + "\n"
+        if not record["existed"] and not text.strip():
+            target.unlink()
+        else:
+            target.write_text(text)
+    path.rename(path.with_name("uninstalled.json"))
+    if not args.no_start:
+        subprocess.run(["systemctl", "--user", "daemon-reload"], check=True)
+        subprocess.run(["hyprctl", "reload"], check=True)
+        errors = subprocess.check_output(["hyprctl", "configerrors"], text=True).strip()
+        if errors:
+            print(errors, file=sys.stderr)
+        # Restore pre-existing helpers, if this installer temporarily replaced them.
+        original_services = [name for name in SERVICES if manifest["files"][f".config/systemd/user/{name}"]["existed"]]
+        if original_services:
+            subprocess.run(["systemctl", "--user", "start", *original_services], check=True)
+    print("Uninstalled. System packages, the udev rule, and backups were retained.")
+    for name in preserved:
+        print(f"Preserved modified file: {name}")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (OSError, ValueError, KeyError, subprocess.SubprocessError) as error:
+        sys.exit(str(error))

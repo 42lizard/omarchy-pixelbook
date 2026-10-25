@@ -1,0 +1,75 @@
+#!/usr/bin/env python3
+"""Download a verified wvkbd release and build our German layout locally."""
+import argparse
+import hashlib
+import json
+from pathlib import Path
+import shutil
+import subprocess
+import tarfile
+import urllib.request
+
+ROOT = Path(__file__).resolve().parent
+VERSION = "0.20"
+URL = f"https://git.sr.ht/~proycon/wvkbd/archive/v{VERSION}.tar.gz"
+SHA512 = "1c5204dc00f7a3bdfd199dfa88b513c46249b7832ba546c0554940539fcc4e0d55303a9f6edd17dd82fd2893b602b86395202311b3ec851f5e8f41895f682371"
+
+
+def replace_once(text, old, new):
+    if text.count(old) != 1:
+        raise ValueError(f"Pinned upstream source changed: expected {old!r} once")
+    return text.replace(old, new, 1)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--archive", type=Path, help="Use an existing release tarball (checksum still verified)")
+    args = parser.parse_args()
+    for command in ("make", "cc", "pkg-config", "wayland-scanner", "xkbcli", "scdoc"):
+        if not shutil.which(command):
+            parser.error(f"Missing {command}; run ./setup-system first")
+    build = ROOT / ".build"
+    build.mkdir(exist_ok=True)
+    archive = args.archive or build / f"wvkbd-{VERSION}.tar.gz"
+    if not archive.exists():
+        temporary = archive.with_suffix(".download")
+        with urllib.request.urlopen(URL, timeout=60) as response, temporary.open("wb") as output:
+            shutil.copyfileobj(response, output)
+        temporary.replace(archive)
+    if hashlib.sha512(archive.read_bytes()).hexdigest() != SHA512:
+        raise SystemExit("Release checksum mismatch; nothing was built or installed")
+    source = build / f"wvkbd-v{VERSION}"
+    # Re-extract the verified baseline before applying the small layout overlay.
+    with tarfile.open(archive) as package:
+        package.extractall(build, filter="data")
+    layout = (source / "layout.mobintl.h").read_text()
+    layout = replace_once(layout, "\tIndex,", "\tGerman,\n\tIndex,")
+    layout = replace_once(layout, "static struct layout layouts[NumLayouts] = {",
+                          'static struct key keys_german[];\n\nstatic struct layout layouts[NumLayouts] = {\n'
+                          '  [German] = {keys_german, "german", "german", true},')
+    (source / "layout.german.h").write_text(layout + '\n#include "german-keys.h"\n')
+    shutil.copy2(ROOT / "keyboard/german-keys.h", source / "german-keys.h")
+    config = (source / "config.mobintl.h").read_text()
+    config = replace_once(config, "  Full,", "  German,")
+    config = replace_once(config, "  Landscape,", "  German,")
+    config = config.replace("#define SHIFT_SPACE_IS_TAB", "/* German Shift+Space is a space. */")
+    (source / "config.german.h").write_text(config)
+    keymap = subprocess.check_output(["xkbcli", "compile-keymap", "--layout", "de"], text=True)
+    (source / "german.xkb").write_text(keymap)
+    header = (source / "keymap.mobintl.h").read_text()
+    header = replace_once(header, "#define NUMKEYMAPS 7", "#define NUMKEYMAPS 8")
+    header = replace_once(header, '"persian", "hebrew" };', '"persian", "hebrew", "german" };')
+    end = header.rfind("};")
+    if end < 0:
+        raise ValueError("Missing upstream keymap table")
+    (source / "keymap.german.h").write_text(header[:end] + ",\n" + json.dumps(keymap) + "\n" + header[end:])
+    # Make does not track config.german.h -> build-german/config.h itself.
+    copied_config = source / "build-german/config.h"
+    if copied_config.exists():
+        copied_config.unlink()
+    subprocess.run(["make", "LAYOUT=german", "-j2"], cwd=source, check=True)
+    print(f"Built {source / 'wvkbd-german'}")
+
+
+if __name__ == "__main__":
+    main()

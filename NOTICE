@@ -1,0 +1,17 @@
+omarchy-pixelbook
+Copyright (C) 2026 omarchy-pixelbook contributors
+Licensed under GNU GPL version 3; see LICENSE.
+
+keyboard/german-keys.h is a modified keyboard layout based on the layout
+structure of wvkbd, Copyright (C) 2020 John Sullivan and contributors.
+Local modifications add a German QWERTZ arrangement and German key labels,
+and use the system XKB German keymap. These modifications are GPL-3.0.
+
+build-keyboard downloads wvkbd v0.20 from its upstream source repository:
+https://git.sr.ht/~proycon/wvkbd
+Release SHA-512:
+1c5204dc00f7a3bdfd199dfa88b513c46249b7832ba546c0554940539fcc4e0d55303a9f6edd17dd82fd2893b602b86395202311b3ec851f5e8f41895f682371
+
+No compiled binaries or upstream source archive are distributed in this repo.
+The downloaded source retains its upstream LICENSE, COPYING and COPYING_WESTON
+files, including notices for components with separate licenses.

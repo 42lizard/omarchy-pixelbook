@@ -1,0 +1,11 @@
+[Unit]
+Description=Pixelbook on-screen keyboard with Fcitx focus detection
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/pixelbook-osk
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=5

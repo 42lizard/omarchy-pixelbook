@@ -1,0 +1,180 @@
+#!/usr/bin/env python3
+"""Install the Pixelbook helpers into the current user's home directory."""
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import shlex
+import shutil
+import subprocess
+import sys
+import time
+
+ROOT = Path(__file__).resolve().parent
+STATE = Path(".local/state/omarchy-pixelbook")
+SERVICES = ["pixelbook-autorotate.service", "pixelbook-osk.service"]
+BEGIN = "-- >>> omarchy-pixelbook >>>"
+END = "-- <<< omarchy-pixelbook <<<"
+BLOCK = (f"{BEGIN}\n"
+         'o.exec_on_start("systemctl --user start pixelbook-autorotate.service")\n'
+         'o.exec_on_start("systemctl --user start pixelbook-osk.service")\n'
+         f"{END}\n")
+FLAGS = ["--ozone-platform=wayland", "--enable-wayland-ime", "--wayland-text-input-version=3"]
+
+
+def digest(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+def write(path, data, mode=0o644):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + ".omarchy-pixelbook-new")
+    temporary.write_bytes(data)
+    temporary.chmod(mode)
+    temporary.replace(path)
+
+
+def live_reload():
+    subprocess.run(["systemctl", "--user", "daemon-reload"], check=True)
+    subprocess.run(["hyprctl", "reload"], check=True)
+    errors = subprocess.check_output(["hyprctl", "configerrors"], text=True).strip()
+    if errors:
+        raise RuntimeError(f"Hyprland rejected the configuration: {errors}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--home", type=Path, default=Path.home(), help="Alternate home for staging; requires --no-start")
+    parser.add_argument("--no-start", action="store_true", help="Write files without contacting the live desktop")
+    parser.add_argument("--keyboard-binary", type=Path, default=ROOT / ".build/wvkbd-v0.20/wvkbd-german")
+    args = parser.parse_args()
+    home = args.home.resolve()
+    if home != Path.home().resolve() and not args.no_start:
+        parser.error("An alternate --home requires --no-start")
+    if os.geteuid() == 0 and not args.no_start:
+        parser.error("Run as your desktop user, without sudo")
+    manifest_path = home / STATE / "install.json"
+    if manifest_path.exists():
+        print("Already installed; no files changed. Uninstall before installing a different version.")
+        return
+    if not args.keyboard_binary.is_file() or not os.access(args.keyboard_binary, os.X_OK):
+        parser.error("German keyboard binary missing; run ./build-keyboard first")
+    if not args.no_start:
+        if os.environ.get("XDG_CONFIG_HOME", str(home / ".config")) != str(home / ".config"):
+            parser.error("Custom XDG_CONFIG_HOME is not supported; use the manual instructions")
+        subprocess.run(["python", "-c", "import dbus"], check=True)
+        subprocess.run(["busctl", "--user", "call", "org.fcitx.Fcitx5", "/controller",
+                        "org.fcitx.Fcitx.Controller1", "CurrentUI"], check=True, stdout=subprocess.DEVNULL)
+
+    files = {}
+    modes = {}
+    edits = {}
+    for name in ("pixelbook-osk", "pixelbook-autorotate"):
+        files[f".local/bin/{name}"] = (ROOT / "bin" / name).read_bytes()
+        modes[f".local/bin/{name}"] = 0o755
+    for name in SERVICES:
+        files[f".config/systemd/user/{name}"] = (ROOT / "systemd" / name).read_bytes()
+    files[".local/share/omarchy-pixelbook/wvkbd-german"] = args.keyboard_binary.read_bytes()
+    modes[".local/share/omarchy-pixelbook/wvkbd-german"] = 0o755
+
+    autostart = ".config/hypr/autostart.lua"
+    previous = (home / autostart).read_text() if (home / autostart).exists() else ""
+    if BEGIN in previous or END in previous:
+        parser.error("Untracked installer markers in autostart.lua; inspect them before installing")
+    # Existing working service lines are reused rather than duplicated.
+    lines = [line for line in BLOCK.splitlines()[1:-1] if line not in previous.splitlines()]
+    added_block = f"{BEGIN}\n" + "\n".join(lines) + f"\n{END}\n" if lines else ""
+    files[autostart] = (previous + ("\n" if previous and not previous.endswith("\n") else "") + added_block).encode()
+    edits[autostart] = {"kind": "autostart", "block": added_block}
+
+    shell = ".config/omarchy/shell.json"
+    shell_path = home / shell
+    if shell_path.exists():
+        settings = json.loads(shell_path.read_text())
+    elif not args.no_start and Path("/usr/share/omarchy/config/omarchy/shell.json").exists():
+        settings = json.loads(Path("/usr/share/omarchy/config/omarchy/shell.json").read_text())
+    else:
+        parser.error("Missing shell.json; copy Omarchy's default configuration before staging")
+    layout = settings["bar"]["layout"]
+    widget = {"id": "pixelbook.osk", "type": "command", "exec": "printf '⌨'",
+              "interval": 3600, "tooltip": "Show/hide on-screen keyboard",
+              "onClick": shlex.quote(str(home / ".local/bin/pixelbook-osk")) + " --toggle"}
+    found = [(section, i, item) for section, items in layout.items() for i, item in enumerate(items)
+             if item.get("id") == "pixelbook.osk"]
+    if len(found) > 1:
+        parser.error("Multiple pixelbook.osk widgets found; inspect shell.json")
+    old_widget = None
+    if found:
+        section, index, old_widget = found[0]
+        layout[section][index] = widget
+    else:
+        layout.setdefault("right", []).insert(0, widget)
+    files[shell] = (json.dumps(settings, indent=2, ensure_ascii=False) + "\n").encode()
+    edits[shell] = {"kind": "bar", "widget": widget, "old_widget": old_widget}
+
+    for browser in ("brave", "chromium"):
+        name = f".config/{browser}-flags.conf"
+        previous = (home / name).read_text() if (home / name).exists() else ""
+        added = []
+        for flag in FLAGS:
+            key = flag.split("=", 1)[0]
+            existing = [line for line in previous.splitlines() if line.split("=", 1)[0] == key]
+            if existing:
+                if flag not in existing:
+                    print(f"Preserving {name}: {existing[0]}; automatic browser activation may need adjustment")
+                continue
+            added.append(flag)
+        files[name] = (previous + ("\n" if previous and not previous.endswith("\n") else "")
+                       + "".join(flag + "\n" for flag in added)).encode()
+        edits[name] = {"kind": "flags", "added": added}
+
+    for name in files:
+        path = home / name
+        if path.is_symlink():
+            parser.error(f"Refusing to replace symlink {path}; install this file manually")
+        if path.exists() and not path.is_file():
+            parser.error(f"Not a regular file: {path}")
+
+    backup = home / STATE / "backups" / (time.strftime("%Y%m%d-%H%M%S") + f"-{time.time_ns()}")
+    backup.mkdir(parents=True, mode=0o700, exist_ok=False)
+    records = {}
+    for name, data in files.items():
+        path = home / name
+        existed = path.exists()
+        if existed:
+            target = backup / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(path, target)
+        records[name] = {"existed": existed, "installed_sha256": digest(data),
+                         "edit": edits.get(name), "mode": modes.get(name, path.stat().st_mode & 0o777 if existed else 0o644)}
+    manifest = {"version": 1, "backup": str(backup.relative_to(home)), "files": records}
+    changed = []
+    try:
+        for name, data in files.items():
+            changed.append(name)
+            write(home / name, data, records[name]["mode"])
+        if not args.no_start:
+            live_reload()
+        write(manifest_path, (json.dumps(manifest, indent=2) + "\n").encode(), 0o600)
+    except BaseException:
+        for name in reversed(changed):
+            path = home / name
+            if records[name]["existed"]:
+                shutil.copy2(backup / name, path)
+            elif path.exists():
+                path.unlink()
+        if not args.no_start:
+            subprocess.run(["hyprctl", "reload"], check=False)
+        raise
+    print(f"Installed. Original files saved in {backup}")
+    if not args.no_start:
+        subprocess.run(["systemctl", "--user", "restart", *SERVICES], check=True)
+    print("Fully quit and reopen Brave/Chromium for the input flags to take effect.")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (OSError, ValueError, KeyError, RuntimeError, subprocess.SubprocessError) as error:
+        sys.exit(str(error))

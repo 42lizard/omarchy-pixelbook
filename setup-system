@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+set -euo pipefail
+root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+rule=/etc/udev/rules.d/70-pixelbook-tablet-switch.rules
+if (( EUID != 0 )); then
+  exec sudo "$0" "$@"
+fi
+case "${1:-}" in
+  --remove-rule)
+    if [[ -e "$rule" ]]; then
+      cmp -s "$root/udev/70-pixelbook-tablet-switch.rules" "$rule" || {
+        echo "Rule differs from this repo; preserving it." >&2; exit 1;
+      }
+      rm -- "$rule"
+    fi
+    ;;
+  "")
+    pacman -S --needed base-devel python python-dbus fcitx5 iio-sensor-proxy wayland libxkbcommon pango cairo scdoc
+    if [[ -e "$rule" ]] && ! cmp -s "$root/udev/70-pixelbook-tablet-switch.rules" "$rule"; then
+      echo "Existing tablet-switch rule differs; preserving it." >&2
+      exit 1
+    fi
+    install -m 644 "$root/udev/70-pixelbook-tablet-switch.rules" "$rule"
+    ;;
+  *) echo "Usage: $0 [--remove-rule]" >&2; exit 2 ;;
+esac
+udevadm control --reload-rules
+for event in /sys/class/input/event*; do
+  if [[ -r "$event/device/name" && $(<"$event/device/name") == "Tablet Mode Switch" ]]; then
+    udevadm trigger --action=change "$event"
+  fi
+done
+echo "System setup complete. The rule grants the active local session access only to the tablet switch."

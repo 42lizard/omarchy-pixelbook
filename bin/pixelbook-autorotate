@@ -1,0 +1,140 @@
+#!/usr/bin/python
+"""Rotate the Pixelbook panel and its inputs only while folded back."""
+
+import fcntl
+import json
+import logging
+import os
+from pathlib import Path
+import signal
+import subprocess
+import time
+
+import dbus
+
+MONITOR = "eDP-1"
+TOUCH = ("wcom50c1:00-2d1f:5143", "wcom50c1:00-2d1f:5143-unknown")
+PEN = "wcom50c1:00-2d1f:5143-stylus"
+TRANSFORMS = {"normal": 0, "left-up": 1, "bottom-up": 2, "right-up": 3}
+EVIOCGSW = (2 << 30) | (8 << 16) | (ord("E") << 8) | 0x1B
+SENSOR_IFACE = "net.hadess.SensorProxy"
+logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+
+
+def tablet_mode():
+    # Discover by name: event numbers can change after reboot.
+    for event in Path("/sys/class/input").glob("event*"):
+        if (event / "device/name").read_text().strip() == "Tablet Mode Switch":
+            with open(Path("/dev/input") / event.name, "rb", buffering=0) as device:
+                state = bytearray(8)
+                fcntl.ioctl(device, EVIOCGSW, state)
+                return bool(state[0] & 2)  # SW_TABLET_MODE = 1
+    raise RuntimeError("Tablet Mode Switch is missing")
+
+
+def desired_transform(folded, orientation, previous):
+    if not folded:
+        return 0
+    # Keep the last orientation when flat or when the sensor is undecided.
+    return TRANSFORMS.get(orientation, previous if previous is not None else 0)
+
+
+def hypr(*args):
+    result = subprocess.run(["hyprctl", *args], capture_output=True, text=True,
+                            timeout=5, check=True)
+    return result.stdout
+
+
+def apply_transform(transform):
+    # Partial monitor updates preserve the user's resolution, scale and position.
+    code = [f'hl.monitor({{ output = "{MONITOR}", transform = {transform} }})']
+    for name in (*TOUCH, PEN):
+        code.append(f'hl.device({{ name = "{name}", output = "{MONITOR}", '
+                    f'transform = {transform} }})')
+    reply = hypr("eval", "; ".join(code)).strip()
+    if reply not in ("", "ok"):
+        raise RuntimeError(reply)
+
+
+def main():
+    # Also prevent duplicates when started manually while the service is running.
+    lock = open(Path(os.environ["XDG_RUNTIME_DIR"]) / "pixelbook-autorotate.lock", "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return
+    signal.signal(signal.SIGTERM, lambda *_: raise_exit())
+    sensor = properties = bus = None
+    previous = None
+    pending = None
+    pending_since = 0.0
+    last_check = 0.0
+    last_error = None
+    try:
+        while True:
+            try:
+                folded = tablet_mode()
+                orientation = "undefined"
+                if folded:
+                    if sensor is None:
+                        bus = dbus.SystemBus(private=True)
+                        proxy = bus.get_object(SENSOR_IFACE, "/net/hadess/SensorProxy")
+                        sensor = dbus.Interface(proxy, SENSOR_IFACE)
+                        properties = dbus.Interface(proxy, "org.freedesktop.DBus.Properties")
+                        sensor.ClaimAccelerometer(timeout=5)
+                    orientation = str(properties.Get(SENSOR_IFACE, "AccelerometerOrientation", timeout=5))
+                elif sensor is not None:
+                    sensor.ReleaseAccelerometer(timeout=5)
+                    bus.close()
+                    sensor = properties = bus = None
+                target = desired_transform(folded, orientation, previous)
+                now = time.monotonic()
+                if target != pending:
+                    pending, pending_since = target, now
+                # Debounce rotation; returning to laptop mode is immediate.
+                if not folded or now - pending_since >= 0.6:
+                    needs_apply = target != previous
+                    if now - last_check >= 2:
+                        monitors = json.loads(hypr("-j", "monitors"))
+                        panel = next((m for m in monitors if m["name"] == MONITOR), None)
+                        if panel is None:
+                            time.sleep(1)
+                            continue
+                        needs_apply |= panel["transform"] != target
+                        last_check = now
+                    if needs_apply:
+                        apply_transform(target)
+                        logging.info("%s: orientation=%s transform=%s",
+                                     "tablet/tent" if folded else "laptop", orientation, target)
+                        previous = target
+                last_error = None
+                time.sleep(0.25)
+            except (OSError, RuntimeError, dbus.DBusException, subprocess.SubprocessError,
+                    ValueError, KeyError) as error:
+                if str(error) != last_error:
+                    logging.error("%s", error)
+                    last_error = str(error)
+                if bus is not None:
+                    bus.close()
+                sensor = properties = bus = None
+                time.sleep(2)
+    finally:
+        if sensor is not None:
+            try:
+                sensor.ReleaseAccelerometer(timeout=5)
+            except dbus.DBusException:
+                pass
+        if bus is not None:
+            bus.close()
+        try:
+            apply_transform(0)
+        except Exception:
+            logging.exception("Could not restore landscape orientation")
+
+
+def raise_exit():
+    raise SystemExit(0)
+
+
+if __name__ == "__main__":
+    main()

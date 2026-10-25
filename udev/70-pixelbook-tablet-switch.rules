@@ -1,0 +1,2 @@
+# Let the active local session read only the Pixelbook tablet-mode switch.
+SUBSYSTEM=="input", KERNEL=="event*", ATTRS{name}=="Tablet Mode Switch", TAG+="uaccess"
