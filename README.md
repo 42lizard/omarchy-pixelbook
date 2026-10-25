@@ -7,7 +7,7 @@ The setup was tested on Omarchy 4.0.6, Hyprland 0.56.2 (Lua configuration), Fcit
 ## What it does
 
 - Rotates the internal display, touchscreen and pen together in tablet/tent mode. Returns to normal landscape in laptop mode; holds the last orientation while the sensor is flat or undecided.
-- Shows the on-screen keyboard when a text field gains focus in tablet mode and hides it when text focus is lost. A top-bar keyboard button provides a manual toggle in either mode.
+- Shows the on-screen keyboard when a text field gains focus in tablet mode and hides it when text focus is lost. Automatic activation is suppressed while a physical USB or Bluetooth keyboard is connected; keyd's virtual keyboard is ignored. A top-bar keyboard button provides a manual toggle in either mode, including with an external keyboard attached.
 - Uses German QWERTZ in both orientations, with ä, ö, ü, ß, @, € and a symbols layer.
 - Keeps Fcitx running with its existing configuration. The helper polls Fcitx's read-only context/focus metadata every 250 ms in tablet mode; wvkbd only provides the keyboard surface and virtual keystrokes. Typed text is not logged.
 - Restarts wvkbd if it exits unexpectedly.
@@ -55,6 +55,8 @@ Existing Fcitx settings, other bindings, keyd settings, monitor resolution/scale
 ## Check it
 
 Fold the Pixelbook back, rotate it, and tap a browser form field. Check `z y ä ö ü ß @ €`, Shift, the symbols layer and both screen orientations. Return to laptop mode and check that the screen is landscape and the keyboard disappears. The keyboard button should still allow a manual show/hide.
+
+In tablet mode, connecting an external USB/Bluetooth keyboard should hide the on-screen keyboard within about a second. Disconnecting it restores automatic activation, including when the same text field remains focused. The bar button remains available for manual use while an external keyboard is connected.
 
 ```sh
 systemctl --user status pixelbook-autorotate pixelbook-osk
