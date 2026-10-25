@@ -14,6 +14,12 @@ The setup was tested on Omarchy 4.0.6, Hyprland 0.56.2 (Lua configuration), Fcit
 
 This is a local integration, not a complete iPad/Android input stack. Automatic activation depends on applications reporting text focus to Fcitx. The manual toggle covers applications that do not.
 
+## Audio setup
+
+Audio on the tested Pixelbook was configured separately using [WeirdTreeThing/chromebook-linux-audio](https://github.com/WeirdTreeThing/chromebook-linux-audio). That setup added Intel AVS driver options, Chromebook-specific ALSA UCM profiles and a WirePlumber headroom adjustment.
+
+For audio on a fresh installation, follow that project's current hardware-specific instructions. This repository's installer and uninstaller do not install, modify or remove the audio setup.
+
 ## Install on a fresh Omarchy system
 
 Clone this repository and enter it:
